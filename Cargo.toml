@@ -1,0 +1,17 @@
+[package]
+name = "kuricrypt"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-based Telegram cryptography extension for Python"
+
+[lib]
+name = "kuricrypt"
+crate-type = ["cdylib"]
+
+[dependencies]
+aes = "0.9.2"
+pyo3 = { version = "0.30", features = ["extension-module"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

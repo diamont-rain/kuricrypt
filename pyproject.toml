@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kuricrypt"
+version = "0.1.0"
+description = "Rust-based Telegram cryptography extension for Python"
+requires-python = ">=3.10"
+
+[tool.maturin]
+module-name = "kuricrypt"
+bindings = "pyo3"
+include = ["kuricrypt.pyi"]
