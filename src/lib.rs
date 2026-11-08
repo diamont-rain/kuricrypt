@@ -98,7 +98,7 @@ impl BlockCipherEncClosure for IgeEncrypt<'_> {
         let mut previous_cipher = u128::from_ne_bytes(self.iv[..16].try_into().unwrap());
         let mut previous_plain = u128::from_ne_bytes(self.iv[16..].try_into().unwrap());
 
-        for chunk in self.data.chunks_exact_mut(16) {
+        for chunk in self.data.chunks_mut(16) {
             let mut plain_bytes = [0u8; 16];
             plain_bytes.copy_from_slice(chunk);
             let plain = u128::from_ne_bytes(plain_bytes);
@@ -127,7 +127,7 @@ impl BlockCipherDecClosure for IgeDecrypt<'_> {
         let mut previous_cipher = u128::from_ne_bytes(self.iv[16..].try_into().unwrap());
         let mut previous_plain = u128::from_ne_bytes(self.iv[..16].try_into().unwrap());
 
-        for chunk in self.data.chunks_exact_mut(16) {
+        for chunk in self.data.chunks_mut(16) {
             let mut cipher_bytes = [0u8; 16];
             cipher_bytes.copy_from_slice(chunk);
             let cipher = u128::from_ne_bytes(cipher_bytes);
@@ -217,26 +217,19 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
         }
 
         let remainder = groups.into_remainder();
-        let mut blocks = remainder.chunks_exact_mut(16);
-        for block in &mut blocks {
+        for block in remainder.chunks_mut(16) {
+            let block_len = block.len();
             let mut stream = AesBlock::from(*counter);
             backend.encrypt_block_inplace(&mut stream);
             let stream: [u8; 16] = stream.into();
-            for index in 0..16 {
+            for index in 0..block_len {
                 block[index] ^= stream[index];
             }
-            increment_counter(counter);
-        }
-
-        let tail = blocks.into_remainder();
-        if !tail.is_empty() {
-            let mut stream = AesBlock::from(*counter);
-            backend.encrypt_block_inplace(&mut stream);
-            let stream: [u8; 16] = stream.into();
-            for index in 0..tail.len() {
-                tail[index] ^= stream[index];
+            if block_len == 16 {
+                increment_counter(counter);
+            } else {
+                *state = block_len as u8;
             }
-            *state = tail.len() as u8;
         }
     }
 }
@@ -266,7 +259,7 @@ impl BlockSizeUser for CbcEncrypt<'_> {
 impl BlockCipherEncClosure for CbcEncrypt<'_> {
     fn call<B: BlockCipherEncBackend<BlockSize = U16>>(self, backend: &B) {
         let mut chain = u128::from_ne_bytes(*self.chain);
-        for chunk in self.data.chunks_exact_mut(16) {
+        for chunk in self.data.chunks_mut(16) {
             let mut plain_bytes = [0u8; 16];
             plain_bytes.copy_from_slice(chunk);
             let plain = u128::from_ne_bytes(plain_bytes);
@@ -291,7 +284,7 @@ impl BlockSizeUser for CbcDecrypt<'_> {
 impl BlockCipherDecClosure for CbcDecrypt<'_> {
     fn call<B: BlockCipherDecBackend<BlockSize = U16>>(self, backend: &B) {
         let mut chain = u128::from_ne_bytes(*self.chain);
-        for chunk in self.data.chunks_exact_mut(16) {
+        for chunk in self.data.chunks_mut(16) {
             let mut cipher_bytes = [0u8; 16];
             cipher_bytes.copy_from_slice(chunk);
             let cipher = u128::from_ne_bytes(cipher_bytes);
