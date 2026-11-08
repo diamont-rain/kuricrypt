@@ -1,5 +1,20 @@
 # kuricrypt
 
+<p align="center">
+	<a href="https://github.com/kurigram-org/kuricrypt/actions/workflows/ci.yml">
+		<img src="https://img.shields.io/github/actions/workflow/status/kurigram-org/kuricrypt/ci.yml?logo=github&label=CI" alt="CI status" />
+	</a>
+	<a href="https://pypi.org/project/kuricrypt/">
+		<img src="https://img.shields.io/pypi/v/kuricrypt.svg?logo=pypi&logoColor=white" alt="PyPI version" />
+	</a>
+	<a href="https://pypi.org/project/kuricrypt/">
+		<img src="https://static.pepy.tech/badge/kuricrypt/month" alt="Monthly downloads" />
+	</a>
+	<a href="https://pypi.org/project/kuricrypt/">
+		<img src="https://img.shields.io/pypi/pyversions/kuricrypt.svg?logo=python&logoColor=white" alt="Python versions" />
+	</a>
+</p>
+
 > Fast cryptography extension library for Telegram clients
 
 **kuricrypt** is a Rust-based Python extension that implements the AES algorithms used by Telegram:
