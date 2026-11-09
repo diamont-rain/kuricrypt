@@ -8,7 +8,8 @@ use aes::{Aes256Dec, Aes256Enc};
 use pyo3::buffer::PyUntypedBuffer;
 use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule, PyTuple};
+use pyo3::types::{PyBytes, PyBytesMethods, PyModule, PyTuple};
+use std::borrow::Cow;
 use std::slice;
 
 type AesBlock = Array<u8, U16>;
@@ -23,24 +24,60 @@ fn maybe_detach<T: Send>(py: Python<'_>, len: usize, work: impl FnOnce() -> T + 
     }
 }
 
-fn read_buffer(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+fn contiguous_buffer(value: &Bound<'_, PyAny>) -> PyResult<PyUntypedBuffer> {
     let buffer = PyUntypedBuffer::get(value)?;
     if !buffer.is_c_contiguous() {
         return Err(PyBufferError::new_err("Buffer must be contiguous"));
     }
+    Ok(buffer)
+}
+
+fn read_data<'a>(value: &'a Bound<'_, PyAny>) -> PyResult<Cow<'a, [u8]>> {
+    if let Ok(bytes) = value.cast_exact::<PyBytes>() {
+        return Ok(Cow::Borrowed(bytes.as_bytes()));
+    }
+    let buffer = contiguous_buffer(value)?;
     let len = buffer.len_bytes();
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok(Cow::Borrowed(&[]));
     }
     let bytes = unsafe { slice::from_raw_parts(buffer.buf_ptr().cast::<u8>(), len) };
-    Ok(bytes.to_vec())
+    Ok(Cow::Owned(bytes.to_vec()))
+}
+
+fn process_data(
+    py: Python<'_>,
+    data: Cow<'_, [u8]>,
+    work: impl FnOnce(&mut [u8]) + Send,
+) -> PyResult<Py<PyBytes>> {
+    let len = data.len();
+    let output = match data {
+        Cow::Borrowed(input) => PyBytes::new_with(py, len, |output| {
+            output.copy_from_slice(input);
+            maybe_detach(py, len, || work(output));
+            Ok(())
+        })?,
+        Cow::Owned(mut output) => {
+            maybe_detach(py, len, || work(&mut output));
+            PyBytes::new(py, &output)
+        }
+    };
+    Ok(output.unbind())
+}
+
+fn read_fixed_buffer<const N: usize>(buffer: &PyUntypedBuffer, name: &str) -> PyResult<[u8; N]> {
+    if buffer.len_bytes() != N {
+        let unit = if N == 1 { "byte" } else { "bytes" };
+        return Err(PyValueError::new_err(format!(
+            "{name} size must be exactly {N} {unit}"
+        )));
+    }
+    // The exported contiguous buffer contains exactly N bytes and stays alive during the read.
+    Ok(unsafe { buffer.buf_ptr().cast::<[u8; N]>().read() })
 }
 
 fn write_buffer(value: &Bound<'_, PyAny>, bytes: &[u8]) -> PyResult<()> {
-    let buffer = PyUntypedBuffer::get(value)?;
-    if !buffer.is_c_contiguous() {
-        return Err(PyBufferError::new_err("Buffer must be contiguous"));
-    }
+    let buffer = contiguous_buffer(value)?;
     if !buffer.readonly() && buffer.len_bytes() == bytes.len() {
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -54,7 +91,7 @@ fn write_buffer(value: &Bound<'_, PyAny>, bytes: &[u8]) -> PyResult<()> {
 }
 
 #[allow(clippy::manual_is_multiple_of)]
-fn check_block_inputs(data: &[u8], key: &[u8], iv: &[u8], iv_size: usize) -> PyResult<()> {
+fn check_block_data(data: &[u8]) -> PyResult<()> {
     if data.is_empty() {
         return Err(PyValueError::new_err("Data must not be empty"));
     }
@@ -62,14 +99,6 @@ fn check_block_inputs(data: &[u8], key: &[u8], iv: &[u8], iv_size: usize) -> PyR
         return Err(PyValueError::new_err(
             "Data size must match a multiple of 16 bytes",
         ));
-    }
-    if key.len() != 32 {
-        return Err(PyValueError::new_err("Key size must be exactly 32 bytes"));
-    }
-    if iv.len() != iv_size {
-        return Err(PyValueError::new_err(format!(
-            "IV size must be exactly {iv_size} bytes"
-        )));
     }
     Ok(())
 }
@@ -141,21 +170,14 @@ impl BlockCipherDecClosure for IgeDecrypt<'_> {
     }
 }
 
-fn ige(mut output: Vec<u8>, key: &[u8], iv: &[u8], encrypt: bool) -> Vec<u8> {
+fn ige(data: &mut [u8], key: &[u8], iv: &[u8], encrypt: bool) {
     if encrypt {
         let cipher = Aes256Enc::new_from_slice(key).expect("validated AES-256 key");
-        cipher.encrypt_with_backend(IgeEncrypt {
-            data: &mut output,
-            iv,
-        });
+        cipher.encrypt_with_backend(IgeEncrypt { data, iv });
     } else {
         let cipher = Aes256Dec::new_from_slice(key).expect("validated AES-256 key");
-        cipher.decrypt_with_backend(IgeDecrypt {
-            data: &mut output,
-            iv,
-        });
+        cipher.decrypt_with_backend(IgeDecrypt { data, iv });
     }
-    output
 }
 
 fn increment_counter(counter: &mut [u8; 16]) {
@@ -234,17 +256,13 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
     }
 }
 
-fn ctr(mut output: Vec<u8>, key: &[u8], iv: &mut [u8], state: &mut u8) -> Vec<u8> {
-    let mut counter = [0u8; 16];
-    counter.copy_from_slice(iv);
+fn ctr(data: &mut [u8], key: &[u8], counter: &mut [u8; 16], state: &mut u8) {
     let cipher = Aes256Enc::new_from_slice(key).expect("validated AES-256 key");
     cipher.encrypt_with_backend(CtrProcess {
-        data: &mut output,
-        counter: &mut counter,
+        data,
+        counter,
         state,
     });
-    iv.copy_from_slice(&counter);
-    output
 }
 
 struct CbcEncrypt<'a> {
@@ -284,7 +302,21 @@ impl BlockSizeUser for CbcDecrypt<'_> {
 impl BlockCipherDecClosure for CbcDecrypt<'_> {
     fn call<B: BlockCipherDecBackend<BlockSize = U16>>(self, backend: &B) {
         let mut chain = u128::from_ne_bytes(*self.chain);
-        for chunk in self.data.chunks_mut(16) {
+        let mut groups = self.data.chunks_exact_mut(B::ParBlocksSize::USIZE * 16);
+        for group in &mut groups {
+            let mut blocks: ParBlocks<B> = Default::default();
+            for (block, chunk) in blocks.iter_mut().zip(group.chunks_exact(16)) {
+                block.copy_from_slice(chunk);
+            }
+            backend.decrypt_par_blocks_inplace(&mut blocks);
+            for (block, chunk) in blocks.iter().zip(group.chunks_exact_mut(16)) {
+                let cipher = u128::from_ne_bytes(chunk.try_into().unwrap());
+                let plain = u128::from_ne_bytes((*block).into()) ^ chain;
+                chunk.copy_from_slice(&plain.to_ne_bytes());
+                chain = cipher;
+            }
+        }
+        for chunk in groups.into_remainder().chunks_exact_mut(16) {
             let mut cipher_bytes = [0u8; 16];
             cipher_bytes.copy_from_slice(chunk);
             let cipher = u128::from_ne_bytes(cipher_bytes);
@@ -298,24 +330,14 @@ impl BlockCipherDecClosure for CbcDecrypt<'_> {
     }
 }
 
-fn cbc(mut output: Vec<u8>, key: &[u8], iv: &mut [u8], encrypt: bool) -> Vec<u8> {
-    let mut chain = [0u8; 16];
-    chain.copy_from_slice(iv);
+fn cbc(data: &mut [u8], key: &[u8], chain: &mut [u8; 16], encrypt: bool) {
     if encrypt {
         let cipher = Aes256Enc::new_from_slice(key).expect("validated AES-256 key");
-        cipher.encrypt_with_backend(CbcEncrypt {
-            data: &mut output,
-            chain: &mut chain,
-        });
+        cipher.encrypt_with_backend(CbcEncrypt { data, chain });
     } else {
         let cipher = Aes256Dec::new_from_slice(key).expect("validated AES-256 key");
-        cipher.decrypt_with_backend(CbcDecrypt {
-            data: &mut output,
-            chain: &mut chain,
-        });
+        cipher.decrypt_with_backend(CbcDecrypt { data, chain });
     }
-    iv.copy_from_slice(&chain);
-    output
 }
 
 fn ige_call(
@@ -325,13 +347,13 @@ fn ige_call(
     iv: Bound<'_, PyAny>,
     encrypt: bool,
 ) -> PyResult<Py<PyBytes>> {
-    let data = read_buffer(&data)?;
-    let key = read_buffer(&key)?;
-    let iv = read_buffer(&iv)?;
-    check_block_inputs(&data, &key, &iv, 32)?;
-    let data_len = data.len();
-    let output = maybe_detach(py, data_len, move || ige(data, &key, &iv, encrypt));
-    Ok(PyBytes::new(py, &output).unbind())
+    let data = read_data(&data)?;
+    let key = contiguous_buffer(&key)?;
+    let iv = contiguous_buffer(&iv)?;
+    check_block_data(&data)?;
+    let key = read_fixed_buffer::<32>(&key, "Key")?;
+    let iv = read_fixed_buffer::<32>(&iv, "IV")?;
+    process_data(py, data, |output| ige(output, &key, &iv, encrypt))
 }
 
 #[pyfunction(signature = (*args))]
@@ -365,37 +387,29 @@ fn ctr_call(
     iv: Bound<'_, PyAny>,
     state: Bound<'_, PyAny>,
 ) -> PyResult<Py<PyBytes>> {
-    let data_bytes = read_buffer(&data)?;
-    let key_bytes = read_buffer(&key)?;
-    let mut iv_bytes = read_buffer(&iv)?;
-    let state_bytes = read_buffer(&state)?;
+    let data_bytes = read_data(&data)?;
+    let key_buffer = contiguous_buffer(&key)?;
+    let iv_buffer = contiguous_buffer(&iv)?;
+    let state_buffer = contiguous_buffer(&state)?;
     if data_bytes.is_empty() {
         return Err(PyValueError::new_err("Data must not be empty"));
     }
-    if key_bytes.len() != 32 {
-        return Err(PyValueError::new_err("Key size must be exactly 32 bytes"));
-    }
-    if iv_bytes.len() != 16 {
-        return Err(PyValueError::new_err("IV size must be exactly 16 bytes"));
-    }
-    if state_bytes.len() != 1 {
-        return Err(PyValueError::new_err("State size must be exactly 1 byte"));
-    }
-    let mut state_byte = state_bytes[0];
+    let key_bytes = read_fixed_buffer::<32>(&key_buffer, "Key")?;
+    let mut iv_bytes = read_fixed_buffer::<16>(&iv_buffer, "IV")?;
+    let [mut state_byte] = read_fixed_buffer::<1>(&state_buffer, "State")?;
+    drop((key_buffer, iv_buffer, state_buffer));
     if state_byte > 15 {
         return Err(PyValueError::new_err(
             "State value must be in the range [0, 15]",
         ));
     }
 
-    let data_len = data_bytes.len();
-    let (output, iv_bytes, state_byte) = maybe_detach(py, data_len, move || {
-        let output = ctr(data_bytes, &key_bytes, &mut iv_bytes, &mut state_byte);
-        (output, iv_bytes, state_byte)
-    });
+    let output = process_data(py, data_bytes, |output| {
+        ctr(output, &key_bytes, &mut iv_bytes, &mut state_byte);
+    })?;
     write_buffer(&iv, &iv_bytes)?;
     write_buffer(&state, &[state_byte])?;
-    Ok(PyBytes::new(py, &output).unbind())
+    Ok(output)
 }
 
 #[pyfunction]
@@ -430,17 +444,18 @@ fn cbc_call(
     iv: Bound<'_, PyAny>,
     encrypt: bool,
 ) -> PyResult<Py<PyBytes>> {
-    let data_bytes = read_buffer(&data)?;
-    let key_bytes = read_buffer(&key)?;
-    let mut iv_bytes = read_buffer(&iv)?;
-    check_block_inputs(&data_bytes, &key_bytes, &iv_bytes, 16)?;
-    let data_len = data_bytes.len();
-    let (output, iv_bytes) = maybe_detach(py, data_len, move || {
-        let output = cbc(data_bytes, &key_bytes, &mut iv_bytes, encrypt);
-        (output, iv_bytes)
-    });
+    let data_bytes = read_data(&data)?;
+    let key_buffer = contiguous_buffer(&key)?;
+    let iv_buffer = contiguous_buffer(&iv)?;
+    check_block_data(&data_bytes)?;
+    let key_bytes = read_fixed_buffer::<32>(&key_buffer, "Key")?;
+    let mut iv_bytes = read_fixed_buffer::<16>(&iv_buffer, "IV")?;
+    drop((key_buffer, iv_buffer));
+    let output = process_data(py, data_bytes, |output| {
+        cbc(output, &key_bytes, &mut iv_bytes, encrypt);
+    })?;
     write_buffer(&iv, &iv_bytes)?;
-    Ok(PyBytes::new(py, &output).unbind())
+    Ok(output)
 }
 
 #[pyfunction(signature = (*args))]
