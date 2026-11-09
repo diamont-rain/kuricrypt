@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    name: Test release tag
+  validate-tag:
+    name: Check release version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -20,30 +20,110 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install TgCrypto reference and kuricrypt
-        run: python -m pip install pytest tgcrypto .
-
-      - name: Run tests
-        run: python -m pytest
-
-      - name: Check Rust formatting and lint
+      - name: Match the tag to Cargo.toml
+        if: github.ref_type == 'tag'
+        shell: python
         run: |
-          cargo fmt --all -- --check
-          cargo clippy --locked --all-targets -- -D warnings
+          import os
+          import tomllib
+          from pathlib import Path
 
-  build-wheels:
-    name: Build Python ${{ matrix.python-version }} on ${{ matrix.os }}
-    needs: test
-    runs-on: ${{ matrix.os }}
+          version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Expected tag v{version}, got {tag}")
+
+  checks:
+    name: Run release checks
+    needs: validate-tag
+    uses: ./.github/workflows/ci.yml
+    with:
+      skip-platform-tests: true
+
+  linux-wheels:
+    name: Build Python ${{ matrix.python-version }} for ${{ matrix.libc }} (${{ matrix.arch }})
+    needs: checks
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        libc: [manylinux_2_28, musllinux_1_2]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - libc: manylinux_2_28
+            compatibility: "2_28"
+          - libc: musllinux_1_2
+            compatibility: musllinux_1_2
+    env:
+      BUILD_IMAGE: quay.io/pypa/${{ matrix.libc }}_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Select Python inside the build image
+        id: python
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          abi="cp${PYTHON_VERSION//./}"
+          echo "path=/opt/python/$abi-$abi/bin/python" >> "$GITHUB_OUTPUT"
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --locked --out dist --interpreter ${{ steps.python.outputs.path }}
+          target: ${{ matrix.arch }}
+          manylinux: ${{ matrix.compatibility }}
+          container: ${{ env.BUILD_IMAGE }}
+          rust-toolchain: stable
+
+      - name: Test the installed wheel
+        env:
+          PYTHON: ${{ steps.python.outputs.path }}
+        run: |
+          docker run --rm --entrypoint sh \
+            --volume "$GITHUB_WORKSPACE:/project:ro" --workdir /project \
+            --env PYTHONDONTWRITEBYTECODE=1 "$BUILD_IMAGE" -e -c '
+              python="$1"
+              "$python" -m pip install pytest dist/*.whl
+              "$python" -m pytest -p no:cacheprovider tests/test_api.py
+            ' sh "$PYTHON"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.libc }}-${{ matrix.arch }}-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  native-wheels:
+    name: Build Python ${{ matrix.python-version }} for ${{ matrix.platform }}
+    needs: checks
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        platform: [macos-x86_64, macos-arm64, windows-x64, windows-arm64]
+        exclude:
+          - platform: windows-arm64
+            python-version: "3.10"
+        include:
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: macos-arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - platform: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - platform: windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v6
 
@@ -51,33 +131,28 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build Linux wheel
-        if: runner.os == 'Linux'
+      - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
-          command: build
-          args: --release --out dist --interpreter python${{ matrix.python-version }}
-          manylinux: "2_28"
+          args: --release --locked --out dist --interpreter python
+          target: ${{ matrix.target }}
+          rust-toolchain: stable
 
-      - name: Build macOS and Windows wheel
-        if: runner.os != 'Linux'
-        uses: PyO3/maturin-action@v1
-        with:
-          command: build
-          args: --release --out dist --interpreter python
-          manylinux: off
+      - name: Test the installed wheel
+        shell: bash
+        run: |
+          python -m pip install pytest dist/*.whl
+          python -m pytest tests/test_api.py
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: wheel-${{ matrix.platform }}-py${{ matrix.python-version }}
           path: dist/*.whl
           if-no-files-found: error
 
-  build-sdist:
+  sdist:
     name: Build source distribution
-    needs: test
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -87,9 +162,9 @@ jobs:
           python-version: "3.13"
 
       - name: Install Maturin
-        run: python -m pip install maturin
+        run: python -m pip install "maturin>=1.8,<2"
 
-      - name: Build sdist
+      - name: Build source archive
         run: maturin sdist --out dist
 
       - uses: actions/upload-artifact@v4
@@ -98,9 +173,10 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  github-release:
+  publish-github:
     name: Publish GitHub release
-    needs: [build-wheels, build-sdist]
+    if: github.ref_type == 'tag'
+    needs: [linux-wheels, native-wheels, sdist]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -113,17 +189,16 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
           generate_release_notes: true
-          make_latest: true
-          draft: false
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           files: dist/*
           fail_on_unmatched_files: true
 
-  pypi-release:
+  publish-pypi:
     name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    if: github.ref_type == 'tag'
+    needs: [linux-wheels, native-wheels, sdist]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
