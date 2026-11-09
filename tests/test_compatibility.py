@@ -29,13 +29,14 @@ class TestTgcryptoCompatibility(unittest.TestCase):
                 self.assertEqual(actual, reference)
 
         for function_name in ("cbc256_encrypt", "cbc256_decrypt"):
-            with self.subTest(function=function_name):
-                reference_iv = bytearray(stream_iv)
-                actual_iv = bytearray(stream_iv)
-                reference = getattr(tgcrypto, function_name)(data, KEY, reference_iv)
-                actual = getattr(kuricrypt, function_name)(data, KEY, actual_iv)
-                self.assertEqual(actual, reference)
-                self.assertEqual(actual_iv, reference_iv)
+            for cbc_data in (data, data[:-16]):
+                with self.subTest(function=function_name, size=len(cbc_data)):
+                    reference_iv = bytearray(stream_iv)
+                    actual_iv = bytearray(stream_iv)
+                    reference = getattr(tgcrypto, function_name)(cbc_data, KEY, reference_iv)
+                    actual = getattr(kuricrypt, function_name)(cbc_data, KEY, actual_iv)
+                    self.assertEqual(actual, reference)
+                    self.assertEqual(actual_iv, reference_iv)
 
         stream_data = data[:-3]
         initial_state = bytearray([7])
