@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      skip-platform-tests:
+        description: Skip the Python test matrix when the release workflow tests built wheels
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -11,6 +17,7 @@ permissions:
 jobs:
   tests:
     name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    if: ${{ !inputs.skip-platform-tests }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
