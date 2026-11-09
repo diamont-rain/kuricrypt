@@ -304,26 +304,26 @@ impl BlockCipherDecClosure for CbcDecrypt<'_> {
         let mut chain = u128::from_ne_bytes(*self.chain);
         let mut groups = self.data.chunks_exact_mut(B::ParBlocksSize::USIZE * 16);
         for group in &mut groups {
+            let (chunks, _) = group.as_chunks_mut::<16>();
             let mut blocks: ParBlocks<B> = Default::default();
-            for (block, chunk) in blocks.iter_mut().zip(group.chunks_exact(16)) {
+            for (block, chunk) in blocks.iter_mut().zip(chunks.iter()) {
                 block.copy_from_slice(chunk);
             }
             backend.decrypt_par_blocks_inplace(&mut blocks);
-            for (block, chunk) in blocks.iter().zip(group.chunks_exact_mut(16)) {
-                let cipher = u128::from_ne_bytes(chunk.try_into().unwrap());
+            for (block, chunk) in blocks.iter().zip(chunks.iter_mut()) {
+                let cipher = u128::from_ne_bytes(*chunk);
                 let plain = u128::from_ne_bytes((*block).into()) ^ chain;
-                chunk.copy_from_slice(&plain.to_ne_bytes());
+                *chunk = plain.to_ne_bytes();
                 chain = cipher;
             }
         }
-        for chunk in groups.into_remainder().chunks_exact_mut(16) {
-            let mut cipher_bytes = [0u8; 16];
-            cipher_bytes.copy_from_slice(chunk);
-            let cipher = u128::from_ne_bytes(cipher_bytes);
-            let mut block = AesBlock::from(cipher.to_ne_bytes());
+        let (tail, _) = groups.into_remainder().as_chunks_mut::<16>();
+        for chunk in tail {
+            let cipher = u128::from_ne_bytes(*chunk);
+            let mut block = AesBlock::from(*chunk);
             backend.decrypt_block_inplace(&mut block);
             let plain = u128::from_ne_bytes(block.into()) ^ chain;
-            chunk.copy_from_slice(&plain.to_ne_bytes());
+            *chunk = plain.to_ne_bytes();
             chain = cipher;
         }
         *self.chain = chain.to_ne_bytes();
