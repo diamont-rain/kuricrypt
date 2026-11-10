@@ -73,6 +73,21 @@ class TestKuricryptApi(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(data, initial_iv + bytearray(range(16, 32)))
 
+    def test_large_buffer_matches_chunked_cbc(self):
+        data = bytes(range(256)) * 256
+        split = len(data) // 2
+        chunked_iv = bytearray(16)
+        expected = kuricrypt.cbc256_encrypt(data[:split], KEY, chunked_iv)
+        expected += kuricrypt.cbc256_encrypt(data[split:], KEY, chunked_iv)
+
+        for source in (data, memoryview(bytearray(data))):
+            with self.subTest(source=type(source)):
+                iv = bytearray(16)
+                actual = kuricrypt.cbc256_encrypt(source, KEY, iv)
+                self.assertIs(type(actual), bytes)
+                self.assertEqual(actual, expected)
+                self.assertEqual(iv, chunked_iv)
+
     def test_validation_errors(self):
         cases: list[tuple[Callable[..., bytes], tuple[Any, ...], str]] = [
             (kuricrypt.ige256_encrypt, (b"", KEY, bytes(32)), "Data must not be empty"),
