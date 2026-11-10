@@ -57,6 +57,12 @@ def cbc256_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes: ...
 
 All functions accept contiguous Python buffer-protocol objects. Writable CTR and CBC `iv` buffers are updated in place. CTR also updates a writable one-byte `state` buffer so a stream can continue across chunks. Immutable buffers are accepted but are not modified.
 
+Each CTR stream must own its `iv` and `state` buffers. Each CBC stream must own its `iv` buffer. When multiple threads use the same stream, protect the entire function call with the same lock, including both `iv` and `state` for CTR. Concurrent calls with shared state can reuse a CTR counter or lose CBC chaining updates. Independent streams can run concurrently with separate state buffers.
+
+Callers must prevent other threads from modifying any argument buffer during a call. This includes writable storage underlying a read-only memoryview and writes from native code.
+
+The extension requires the GIL for Python buffer access. Importing it on free-threaded CPython enables the GIL under the interpreter's default configuration. Calls processing at least 2048 bytes release the GIL during cryptographic computation.
+
 ## Usage
 
 ### IGE Mode

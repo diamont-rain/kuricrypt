@@ -6,15 +6,16 @@ use aes::cipher::{
 };
 use aes::{Aes256Dec, Aes256Enc};
 use pyo3::buffer::PyUntypedBuffer;
-use pyo3::exceptions::{PyBufferError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBufferError, PyValueError};
+use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyBytesMethods, PyModule, PyTuple};
-use std::borrow::Cow;
-use std::slice;
+use pyo3::types::{PyBytes, PyBytesMethods, PyModule};
+use std::{ptr, slice};
 
 type AesBlock = Array<u8, U16>;
 
 const GIL_RELEASE_MIN: usize = 2048;
+const DIRECT_OUTPUT_MIN: usize = 64 * 1024;
 
 fn maybe_detach<T: Send>(py: Python<'_>, len: usize, work: impl FnOnce() -> T + Send) -> T {
     if len >= GIL_RELEASE_MIN {
@@ -32,83 +33,164 @@ fn contiguous_buffer(value: &Bound<'_, PyAny>) -> PyResult<PyUntypedBuffer> {
     Ok(buffer)
 }
 
-fn read_data<'a>(value: &'a Bound<'_, PyAny>) -> PyResult<Cow<'a, [u8]>> {
-    if let Ok(bytes) = value.cast_exact::<PyBytes>() {
-        return Ok(Cow::Borrowed(bytes.as_bytes()));
-    }
-    let buffer = contiguous_buffer(value)?;
-    let len = buffer.len_bytes();
-    if len == 0 {
-        return Ok(Cow::Borrowed(&[]));
-    }
-    let bytes = unsafe { slice::from_raw_parts(buffer.buf_ptr().cast::<u8>(), len) };
-    Ok(Cow::Owned(bytes.to_vec()))
+enum Input<'a> {
+    Bytes(&'a [u8]),
+    Buffer(PyUntypedBuffer),
 }
 
-fn process_data(
-    py: Python<'_>,
-    data: Cow<'_, [u8]>,
-    work: impl FnOnce(&mut [u8]) + Send,
-) -> PyResult<Py<PyBytes>> {
-    let len = data.len();
-    let output = match data {
-        Cow::Borrowed(input) => PyBytes::new_with(py, len, |output| {
-            output.copy_from_slice(input);
-            maybe_detach(py, len, || work(output));
-            Ok(())
-        })?,
-        Cow::Owned(mut output) => {
-            maybe_detach(py, len, || work(&mut output));
-            PyBytes::new(py, &output)
+impl<'a> Input<'a> {
+    fn get(value: &'a Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(bytes) = value.cast_exact::<PyBytes>() {
+            return Ok(Self::Bytes(bytes.as_bytes()));
         }
-    };
-    Ok(output.unbind())
+        Ok(Self::Buffer(contiguous_buffer(value)?))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Buffer(buffer) => buffer.len_bytes(),
+        }
+    }
+
+    fn copy_to(self, output: &mut [u8]) {
+        match self {
+            Self::Bytes(bytes) => output.copy_from_slice(bytes),
+            Self::Buffer(buffer) if !output.is_empty() => {
+                // The export pins the contiguous source for this copy.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        buffer.buf_ptr().cast::<u8>(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                    );
+                }
+            }
+            Self::Buffer(_) => {}
+        }
+    }
+
+    fn with_output<'py, R>(
+        self,
+        py: Python<'py>,
+        work: impl FnOnce(&mut [u8]) -> PyResult<R>,
+    ) -> PyResult<(Bound<'py, PyBytes>, R)> {
+        let len = self.len();
+        debug_assert!(len >= DIRECT_OUTPUT_MIN);
+
+        // A NULL source allocates private, uninitialized bytes. Initialize every byte
+        // before creating the mutable slice, and keep the object private until work ends.
+        let (output, bytes) = unsafe {
+            let object = ffi::PyBytes_FromStringAndSize(ptr::null(), len as ffi::Py_ssize_t);
+            let output = Bound::from_owned_ptr_or_err(py, object)?.cast_into_unchecked::<PyBytes>();
+            let bytes = ffi::PyBytes_AsString(output.as_ptr()).cast::<u8>();
+            if bytes.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            match self {
+                Self::Bytes(input) => ptr::copy_nonoverlapping(input.as_ptr(), bytes, len),
+                Self::Buffer(buffer) => {
+                    ptr::copy_nonoverlapping(buffer.buf_ptr().cast::<u8>(), bytes, len);
+                }
+            }
+            (output, slice::from_raw_parts_mut(bytes, len))
+        };
+        let result = work(bytes)?;
+        Ok((output, result))
+    }
+
+    fn read_fixed<const N: usize>(&self, name: &str) -> PyResult<[u8; N]> {
+        if self.len() != N {
+            let unit = if N == 1 { "byte" } else { "bytes" };
+            return Err(PyValueError::new_err(format!(
+                "{name} size must be exactly {N} {unit}"
+            )));
+        }
+        match self {
+            Self::Bytes(bytes) => Ok((*bytes).try_into().expect("validated buffer size")),
+            // The export pins the contiguous source and the size was checked above.
+            Self::Buffer(buffer) => Ok(unsafe { buffer.buf_ptr().cast::<[u8; N]>().read() }),
+        }
+    }
 }
 
-fn read_fixed_buffer<const N: usize>(buffer: &PyUntypedBuffer, name: &str) -> PyResult<[u8; N]> {
-    if buffer.len_bytes() != N {
-        let unit = if N == 1 { "byte" } else { "bytes" };
-        return Err(PyValueError::new_err(format!(
-            "{name} size must be exactly {N} {unit}"
-        )));
+fn process_data<T: Send, R: Send>(
+    py: Python<'_>,
+    data: Input<'_>,
+    prepare: impl FnOnce(usize) -> PyResult<T>,
+    work: impl FnOnce(&mut [u8], T) -> R + Send,
+) -> PyResult<(Py<PyBytes>, R)> {
+    let len = data.len();
+    if len >= DIRECT_OUTPUT_MIN {
+        return process_large_data(py, data, prepare, work);
     }
-    // The exported contiguous buffer contains exactly N bytes and stays alive during the read.
-    Ok(unsafe { buffer.buf_ptr().cast::<[u8; N]>().read() })
+    let mut result = None;
+    let process = |output: &mut [u8], args| {
+        result = Some(maybe_detach(py, len, || work(output, args)));
+        Ok(())
+    };
+    let output = match data {
+        Input::Bytes(input) => {
+            let args = prepare(len)?;
+            PyBytes::new_with(py, len, |output| {
+                output.copy_from_slice(input);
+                process(output, args)
+            })
+        }
+        Input::Buffer(_) => PyBytes::new_with(py, len, |output| {
+            // Snapshot the input before invoking the other buffer exporters.
+            data.copy_to(output);
+            process(output, prepare(len)?)
+        }),
+    }?;
+    Ok((output.unbind(), result.expect("output was processed")))
+}
+
+#[inline(never)]
+fn process_large_data<T: Send, R: Send>(
+    py: Python<'_>,
+    data: Input<'_>,
+    prepare: impl FnOnce(usize) -> PyResult<T>,
+    work: impl FnOnce(&mut [u8], T) -> R + Send,
+) -> PyResult<(Py<PyBytes>, R)> {
+    let len = data.len();
+    let args = match &data {
+        Input::Bytes(_) => Ok(prepare(len)?),
+        Input::Buffer(_) => Err(prepare),
+    };
+    let (output, result) = data.with_output(py, |output| {
+        // Snapshot buffer input before invoking the other buffer exporters.
+        let args = match args {
+            Ok(args) => args,
+            Err(prepare) => prepare(len)?,
+        };
+        Ok(maybe_detach(py, len, || work(output, args)))
+    })?;
+    Ok((output.unbind(), result))
 }
 
 fn write_buffer(value: &Bound<'_, PyAny>, bytes: &[u8]) -> PyResult<()> {
+    if value.cast_exact::<PyBytes>().is_ok() {
+        return Ok(());
+    }
     let buffer = contiguous_buffer(value)?;
     if !buffer.readonly() && buffer.len_bytes() == bytes.len() {
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                buffer.buf_ptr().cast::<u8>(),
-                bytes.len(),
-            );
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.buf_ptr().cast::<u8>(), bytes.len());
         }
     }
     Ok(())
 }
 
 #[allow(clippy::manual_is_multiple_of)]
-fn check_block_data(data: &[u8]) -> PyResult<()> {
-    if data.is_empty() {
+fn check_block_data(len: usize) -> PyResult<()> {
+    if len == 0 {
         return Err(PyValueError::new_err("Data must not be empty"));
     }
-    if data.len() % 16 != 0 {
+    if len % 16 != 0 {
         return Err(PyValueError::new_err(
             "Data size must match a multiple of 16 bytes",
         ));
-    }
-    Ok(())
-}
-
-fn check_arg_count(args: &Bound<'_, PyTuple>, expected: usize) -> PyResult<()> {
-    if args.len() != expected {
-        return Err(PyTypeError::new_err(format!(
-            "function takes exactly {expected} arguments ({} given)",
-            args.len()
-        )));
     }
     Ok(())
 }
@@ -127,15 +209,14 @@ impl BlockCipherEncClosure for IgeEncrypt<'_> {
         let mut previous_cipher = u128::from_ne_bytes(self.iv[..16].try_into().unwrap());
         let mut previous_plain = u128::from_ne_bytes(self.iv[16..].try_into().unwrap());
 
-        for chunk in self.data.chunks_mut(16) {
-            let mut plain_bytes = [0u8; 16];
-            plain_bytes.copy_from_slice(chunk);
-            let plain = u128::from_ne_bytes(plain_bytes);
+        let (blocks, _) = self.data.as_chunks_mut::<16>();
+        for chunk in blocks {
+            let plain = u128::from_ne_bytes(*chunk);
             let mut block = AesBlock::from((plain ^ previous_cipher).to_ne_bytes());
             backend.encrypt_block_inplace(&mut block);
             let encrypted = u128::from_ne_bytes(block.into());
             let output = encrypted ^ previous_plain;
-            chunk.copy_from_slice(&output.to_ne_bytes());
+            *chunk = output.to_ne_bytes();
             previous_cipher = output;
             previous_plain = plain;
         }
@@ -156,14 +237,13 @@ impl BlockCipherDecClosure for IgeDecrypt<'_> {
         let mut previous_cipher = u128::from_ne_bytes(self.iv[16..].try_into().unwrap());
         let mut previous_plain = u128::from_ne_bytes(self.iv[..16].try_into().unwrap());
 
-        for chunk in self.data.chunks_mut(16) {
-            let mut cipher_bytes = [0u8; 16];
-            cipher_bytes.copy_from_slice(chunk);
-            let cipher = u128::from_ne_bytes(cipher_bytes);
+        let (blocks, _) = self.data.as_chunks_mut::<16>();
+        for chunk in blocks {
+            let cipher = u128::from_ne_bytes(*chunk);
             let mut block = AesBlock::from((cipher ^ previous_cipher).to_ne_bytes());
             backend.decrypt_block_inplace(&mut block);
             let decrypted = u128::from_ne_bytes(block.into()) ^ previous_plain;
-            chunk.copy_from_slice(&decrypted.to_ne_bytes());
+            *chunk = decrypted.to_ne_bytes();
             previous_cipher = decrypted;
             previous_plain = cipher;
         }
@@ -222,21 +302,21 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
 
         let parallel_width = B::ParBlocksSize::USIZE;
         let mut groups = data[offset..].chunks_exact_mut(parallel_width * 16);
+        let mut counter_value = u128::from_be_bytes(*counter);
         for group in &mut groups {
+            let (chunks, _) = group.as_chunks_mut::<16>();
             let mut streams: ParBlocks<B> = Default::default();
             for stream in streams.iter_mut() {
-                *stream = AesBlock::from(*counter);
-                increment_counter(counter);
+                *stream = AesBlock::from(counter_value.to_be_bytes());
+                counter_value = counter_value.wrapping_add(1);
             }
             backend.encrypt_par_blocks_inplace(&mut streams);
-            for (block_index, stream) in streams.iter().enumerate() {
-                let stream: [u8; 16] = (*stream).into();
-                let start = block_index * 16;
-                for index in 0..16 {
-                    group[start + index] ^= stream[index];
-                }
+            for (chunk, stream) in chunks.iter_mut().zip(streams.iter()) {
+                *chunk = (u128::from_ne_bytes(*chunk) ^ u128::from_ne_bytes((*stream).into()))
+                    .to_ne_bytes();
             }
         }
+        *counter = counter_value.to_be_bytes();
 
         let remainder = groups.into_remainder();
         for block in remainder.chunks_mut(16) {
@@ -277,14 +357,13 @@ impl BlockSizeUser for CbcEncrypt<'_> {
 impl BlockCipherEncClosure for CbcEncrypt<'_> {
     fn call<B: BlockCipherEncBackend<BlockSize = U16>>(self, backend: &B) {
         let mut chain = u128::from_ne_bytes(*self.chain);
-        for chunk in self.data.chunks_mut(16) {
-            let mut plain_bytes = [0u8; 16];
-            plain_bytes.copy_from_slice(chunk);
-            let plain = u128::from_ne_bytes(plain_bytes);
+        let (blocks, _) = self.data.as_chunks_mut::<16>();
+        for chunk in blocks {
+            let plain = u128::from_ne_bytes(*chunk);
             let mut block = AesBlock::from((plain ^ chain).to_ne_bytes());
             backend.encrypt_block_inplace(&mut block);
             chain = u128::from_ne_bytes(block.into());
-            chunk.copy_from_slice(&chain.to_ne_bytes());
+            *chunk = chain.to_ne_bytes();
         }
         *self.chain = chain.to_ne_bytes();
     }
@@ -347,37 +426,38 @@ fn ige_call(
     iv: Bound<'_, PyAny>,
     encrypt: bool,
 ) -> PyResult<Py<PyBytes>> {
-    let data = read_data(&data)?;
-    let key = contiguous_buffer(&key)?;
-    let iv = contiguous_buffer(&iv)?;
-    check_block_data(&data)?;
-    let key = read_fixed_buffer::<32>(&key, "Key")?;
-    let iv = read_fixed_buffer::<32>(&iv, "IV")?;
-    process_data(py, data, |output| ige(output, &key, &iv, encrypt))
+    let (output, ()) = process_data(
+        py,
+        Input::get(&data)?,
+        |len| {
+            let key = Input::get(&key)?;
+            let iv = Input::get(&iv)?;
+            check_block_data(len)?;
+            Ok((key.read_fixed::<32>("Key")?, iv.read_fixed::<32>("IV")?))
+        },
+        |output, (key, iv)| ige(output, &key, &iv, encrypt),
+    )?;
+    Ok(output)
 }
 
-#[pyfunction(signature = (*args))]
-fn ige256_encrypt(py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyBytes>> {
-    check_arg_count(&args, 3)?;
-    ige_call(
-        py,
-        args.get_item(0)?,
-        args.get_item(1)?,
-        args.get_item(2)?,
-        true,
-    )
+#[pyfunction(signature = (data, key, iv, /))]
+fn ige256_encrypt(
+    py: Python<'_>,
+    data: Bound<'_, PyAny>,
+    key: Bound<'_, PyAny>,
+    iv: Bound<'_, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    ige_call(py, data, key, iv, true)
 }
 
-#[pyfunction(signature = (*args))]
-fn ige256_decrypt(py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyBytes>> {
-    check_arg_count(&args, 3)?;
-    ige_call(
-        py,
-        args.get_item(0)?,
-        args.get_item(1)?,
-        args.get_item(2)?,
-        false,
-    )
+#[pyfunction(signature = (data, key, iv, /))]
+fn ige256_decrypt(
+    py: Python<'_>,
+    data: Bound<'_, PyAny>,
+    key: Bound<'_, PyAny>,
+    iv: Bound<'_, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    ige_call(py, data, key, iv, false)
 }
 
 fn ctr_call(
@@ -387,54 +467,56 @@ fn ctr_call(
     iv: Bound<'_, PyAny>,
     state: Bound<'_, PyAny>,
 ) -> PyResult<Py<PyBytes>> {
-    let data_bytes = read_data(&data)?;
-    let key_buffer = contiguous_buffer(&key)?;
-    let iv_buffer = contiguous_buffer(&iv)?;
-    let state_buffer = contiguous_buffer(&state)?;
-    if data_bytes.is_empty() {
-        return Err(PyValueError::new_err("Data must not be empty"));
-    }
-    let key_bytes = read_fixed_buffer::<32>(&key_buffer, "Key")?;
-    let mut iv_bytes = read_fixed_buffer::<16>(&iv_buffer, "IV")?;
-    let [mut state_byte] = read_fixed_buffer::<1>(&state_buffer, "State")?;
-    drop((key_buffer, iv_buffer, state_buffer));
-    if state_byte > 15 {
-        return Err(PyValueError::new_err(
-            "State value must be in the range [0, 15]",
-        ));
-    }
-
-    let output = process_data(py, data_bytes, |output| {
-        ctr(output, &key_bytes, &mut iv_bytes, &mut state_byte);
-    })?;
-    write_buffer(&iv, &iv_bytes)?;
+    let (output, (counter, state_byte)) = process_data(
+        py,
+        Input::get(&data)?,
+        |len| {
+            let key = Input::get(&key)?;
+            let iv = Input::get(&iv)?;
+            let state = Input::get(&state)?;
+            if len == 0 {
+                return Err(PyValueError::new_err("Data must not be empty"));
+            }
+            let key = key.read_fixed::<32>("Key")?;
+            let counter = iv.read_fixed::<16>("IV")?;
+            let [state] = state.read_fixed::<1>("State")?;
+            if state > 15 {
+                return Err(PyValueError::new_err(
+                    "State value must be in the range [0, 15]",
+                ));
+            }
+            Ok((key, counter, state))
+        },
+        |output, (key, mut counter, mut state)| {
+            ctr(output, &key, &mut counter, &mut state);
+            (counter, state)
+        },
+    )?;
+    write_buffer(&iv, &counter)?;
     write_buffer(&state, &[state_byte])?;
     Ok(output)
 }
 
-#[pyfunction]
-#[pyo3(signature = (*args))]
-fn ctr256_encrypt(py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyBytes>> {
-    check_arg_count(&args, 4)?;
-    ctr_call(
-        py,
-        args.get_item(0)?,
-        args.get_item(1)?,
-        args.get_item(2)?,
-        args.get_item(3)?,
-    )
+#[pyfunction(signature = (data, key, iv, state, /))]
+fn ctr256_encrypt(
+    py: Python<'_>,
+    data: Bound<'_, PyAny>,
+    key: Bound<'_, PyAny>,
+    iv: Bound<'_, PyAny>,
+    state: Bound<'_, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    ctr_call(py, data, key, iv, state)
 }
 
-#[pyfunction(signature = (*args))]
-fn ctr256_decrypt(py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyBytes>> {
-    check_arg_count(&args, 4)?;
-    ctr_call(
-        py,
-        args.get_item(0)?,
-        args.get_item(1)?,
-        args.get_item(2)?,
-        args.get_item(3)?,
-    )
+#[pyfunction(signature = (data, key, iv, state, /))]
+fn ctr256_decrypt(
+    py: Python<'_>,
+    data: Bound<'_, PyAny>,
+    key: Bound<'_, PyAny>,
+    iv: Bound<'_, PyAny>,
+    state: Bound<'_, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    ctr_call(py, data, key, iv, state)
 }
 
 fn cbc_call(
@@ -444,45 +526,46 @@ fn cbc_call(
     iv: Bound<'_, PyAny>,
     encrypt: bool,
 ) -> PyResult<Py<PyBytes>> {
-    let data_bytes = read_data(&data)?;
-    let key_buffer = contiguous_buffer(&key)?;
-    let iv_buffer = contiguous_buffer(&iv)?;
-    check_block_data(&data_bytes)?;
-    let key_bytes = read_fixed_buffer::<32>(&key_buffer, "Key")?;
-    let mut iv_bytes = read_fixed_buffer::<16>(&iv_buffer, "IV")?;
-    drop((key_buffer, iv_buffer));
-    let output = process_data(py, data_bytes, |output| {
-        cbc(output, &key_bytes, &mut iv_bytes, encrypt);
-    })?;
-    write_buffer(&iv, &iv_bytes)?;
+    let (output, chain) = process_data(
+        py,
+        Input::get(&data)?,
+        |len| {
+            let key = Input::get(&key)?;
+            let iv = Input::get(&iv)?;
+            check_block_data(len)?;
+            Ok((key.read_fixed::<32>("Key")?, iv.read_fixed::<16>("IV")?))
+        },
+        |output, (key, mut chain)| {
+            cbc(output, &key, &mut chain, encrypt);
+            chain
+        },
+    )?;
+    write_buffer(&iv, &chain)?;
     Ok(output)
 }
 
-#[pyfunction(signature = (*args))]
-fn cbc256_encrypt(py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyBytes>> {
-    check_arg_count(&args, 3)?;
-    cbc_call(
-        py,
-        args.get_item(0)?,
-        args.get_item(1)?,
-        args.get_item(2)?,
-        true,
-    )
+#[pyfunction(signature = (data, key, iv, /))]
+fn cbc256_encrypt(
+    py: Python<'_>,
+    data: Bound<'_, PyAny>,
+    key: Bound<'_, PyAny>,
+    iv: Bound<'_, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    cbc_call(py, data, key, iv, true)
 }
 
-#[pyfunction(signature = (*args))]
-fn cbc256_decrypt(py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<Py<PyBytes>> {
-    check_arg_count(&args, 3)?;
-    cbc_call(
-        py,
-        args.get_item(0)?,
-        args.get_item(1)?,
-        args.get_item(2)?,
-        false,
-    )
+#[pyfunction(signature = (data, key, iv, /))]
+fn cbc256_decrypt(
+    py: Python<'_>,
+    data: Bound<'_, PyAny>,
+    key: Bound<'_, PyAny>,
+    iv: Bound<'_, PyAny>,
+) -> PyResult<Py<PyBytes>> {
+    cbc_call(py, data, key, iv, false)
 }
 
-#[pymodule]
+// Raw access to Python buffers relies on the GIL during input copies and writeback.
+#[pymodule(gil_used = true)]
 fn kuricrypt(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(ige256_encrypt, module)?)?;
     module.add_function(wrap_pyfunction!(ige256_decrypt, module)?)?;
