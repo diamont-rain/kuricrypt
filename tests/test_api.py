@@ -61,6 +61,18 @@ class TestKuricryptApi(unittest.TestCase):
         expected = kuricrypt.ige256_encrypt(data.tobytes(), key.tobytes(), iv.tobytes())
         self.assertEqual(actual, expected)
 
+    def test_writable_data_view_can_alias_cbc_iv(self):
+        data = bytearray(range(32))
+        iv = memoryview(data)[:16]
+        initial_iv = bytearray(iv)
+        expected = kuricrypt.cbc256_encrypt(bytes(data), KEY, initial_iv)
+
+        actual = kuricrypt.cbc256_encrypt(memoryview(data), KEY, iv)
+
+        self.assertIs(type(actual), bytes)
+        self.assertEqual(actual, expected)
+        self.assertEqual(data, initial_iv + bytearray(range(16, 32)))
+
     def test_validation_errors(self):
         cases: list[tuple[Callable[..., bytes], tuple[Any, ...], str]] = [
             (kuricrypt.ige256_encrypt, (b"", KEY, bytes(32)), "Data must not be empty"),
